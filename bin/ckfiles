@@ -1,0 +1,319 @@
+#!/usr/bin/env ruby
+# encoding: utf-8
+
+=begin
+#
+# General file integrity checker, can check recursively. Support SFV, MD5, ZIP, CBZ, 7Z, GZ, BZ2, LHA, LZH, ARJ, CHM, XZ, RAR, CBR and media file containing CRC32 sum in filename with extension  with AVI, MKV, MP4, OGM, ASF, RM, RAM, WEBM. Require 7zip and Unrar for checking archive file. Supports Linux / Mac OS X / Windows.
+#
+
+
+# attribute format
+v1
+  ckfiles.result   attribute version, unix epoxy time
+example
+  ckfiles.result   1, 1385724368
+=end
+
+# making sure program runs in UTF-8 encoding in any environment
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+
+
+# make print behave as print
+STDOUT.sync = true
+
+# executable program sanity check
+if `7z -h` =~ /Igor Pavlov/
+	$HAVE_BIN_7Z = true
+else
+	$HAVE_BIN_7Z = false
+	puts "***** NOTICE: 7z not installed *****"
+end
+
+if `unrar -v` =~ /Alexander Roshal/
+	$HAVE_BIN_UNRAR = true
+else
+	$HAVE_BIN_UNRAR = false
+	puts "***** NOTICE: unrar not installed *****"
+end
+
+
+require 'ffi-xattr'
+require 'fileutils'
+require 'ckfiles/libs'
+require 'digest/md5'
+require 'getoptlong'
+
+if RUBY_PLATFORM =~ /mingw/
+	# Windows support
+	# using Windows API to directly list files and directory
+	# otherwise unicode filenames will be be supported, it will all be in ?????? characters (hex falue 3F)
+
+	# ensure command prompt runs in unicode
+	`chcp 65001`
+
+	co = `chcp`.scan(/[0-9]+/).join.to_i
+	if co != 65001
+		puts 'Fail to run in unicode mode!'
+		exit
+	end
+
+	require 'win32ole'
+	$fso = WIN32OLE.new('Scripting.FileSystemObject')
+end
+
+
+# start up environment
+$noop = false
+$read_only = false
+$expiry = 3600*24*90 # expiry time default to 90 days
+$recursive = false
+$outfile = false
+
+def tpass( f )
+	if $read_only == false
+		begin
+			fd = Xattr.new( f )
+			
+			param = 'ckfiles.result'
+			param = 'user.' + param if RUBY_PLATFORM =~ /linux/
+			fd.set(param, "1, #{Time.now.to_i.to_s}")
+
+			puts "pass - #{ f }"
+		rescue => errmsg
+			puts "pass - set attr failed: #{ f }"
+		end
+	else
+		puts "pass - #{ f }"
+	end
+end
+
+def tfail( f )
+	s = "fail - #{ f }"
+	puts s
+	File.open($outfile, 'ab') { |io| io << s + "\r\n" } if $outfile # write failed result to file
+	
+	if $noop == false and $read_only == false
+		newdir = File.dirname(f) + '/Corrupted'
+		Dir.mkdir( newdir ) if ! File.directory?( newdir )
+		File.rename( f , "#{ newdir }/#{ File.basename(f) }" )
+	end
+end
+
+# is file already passed?
+def File.passed?( file, expiry=$expiry )
+	fd = Xattr.new( file )
+	param = 'ckfiles.result'
+	param = 'user.' + param if RUBY_PLATFORM =~ /linux/
+	begin
+		iresult = fd.get(param).split(', ')
+		iver = iresult[0]
+		itime = iresult[1].to_i
+		
+		# file already passed, skip
+		if ( Time.now.to_i - itime ) < expiry
+			return true
+		end
+	rescue
+		# attribute not found, so continue
+	end
+	return false
+end
+
+
+def show_help
+	puts \
+%Q{Usage:
+ckfiles [arguments] [dir] <dir2> <dir3> ...
+
+Arguments:
+--recursive  -r  Recursively check all files
+--noop       -n  Not moving corrupted files
+--read-only  -x  Read Only, do not write attribute (imply -n)
+--expiry     -e  Expiry time since last check, can be in seconds, or m/h/d/w/mo/y
+--outfile    -o  Output error to a file
+--help       -h  Display current help message}
+end
+
+
+#<main>
+opts = GetoptLong.new(
+	[ '--recursive', '-r',  GetoptLong::NO_ARGUMENT ],
+	[ '--noop',      '-n',  GetoptLong::NO_ARGUMENT ],
+	[ '--read-only', '-x',	GetoptLong::NO_ARGUMENT ],
+	[ '--expiry',	 '-e',	GetoptLong::REQUIRED_ARGUMENT ],
+	[ '--outfile',	 '-o',	GetoptLong::REQUIRED_ARGUMENT ],
+	[ '--help',      '-h',  GetoptLong::NO_ARGUMENT ],
+)
+
+opts.each { |opt,arg|
+	case opt
+		when '--help'
+			show_help
+			exit
+		when '--recursive'
+			$recursive = true
+		when '--noop'
+			$noop = true
+		when '--read-only'
+			$noop = true
+			$read_only = true
+		when '--expiry'
+			$expiry = arg.timelength_to_i
+		when '--outfile'
+			$outfile = arg
+	end
+}
+
+
+dirs = []
+if ARGV.length > 0
+	for dir in ARGV
+		if File.directory?( dir )
+			dirs << File.expand_path( dir )
+		else
+			puts "dir don't exists #{dir}"
+		end
+	end
+else
+	show_help
+	exit
+end
+
+
+def chkDir(dir)
+	files = []
+
+	if RUBY_PLATFORM =~ /mingw/
+		# Windows API call for listing files and folders
+
+		gf = $fso.GetFolder(dir)
+		for file in gf.Files
+			files << file.path
+		end
+
+		for folder in gf.SubFolders
+			files << folder.path
+		end
+	else
+		# POSIX supported file/directory listing
+
+		files = Dir.entries(dir)
+		files.delete_if { |f| f[0] == '.' and f[-1] == '.' }
+		files.collect! { |f| dir + '/' + f }
+	end
+
+	for f in files
+		# skip restricted file/directory
+		next if Dir.restricted?( f )
+
+		if File.file?( f )
+			# skip unwanted files or non-regular file
+			next if File.basename( f ) =~ /^\._.+/
+			next if File.basename( f ) =~ /^\..+$/
+			next if File.exists?( f + '.lftp-pget-status' )
+
+			# skip already passed file
+			next if File.passed?( f )
+
+
+			if f =~ /\.(zip|cbz|7z|gz|bz2|lha|lzh|arj|chm|xz)$/i
+				# skip if 7z executable isn't found
+				next unless $HAVE_BIN_7Z
+
+				# to go around "invalid byte sequence in UTF-8" error
+				result = `7z t -pAAA "#{f}" 2>&1`.encode('UTF-8', 'binary', invalid: :replace, undef: :replace, replace: '')
+				
+				if result =~ /Everything is Ok/
+					tpass( f )
+				else
+					tfail( f )
+				end
+							
+			elsif f =~ /\.(rar|cbr)$/i
+				# skip if unrar executable isn't found
+				next unless $HAVE_BIN_UNRAR
+
+				if f =~ /\.part[0-9]+\.rar$/i
+					# skip file if the part rar file isn't the first one
+					next if (f =~ /\.part[0]+1\.rar$/i) == nil
+				end
+				
+				if `unrar t -p- "#{f}" 2>&1` =~ /All OK/
+					tpass( f )
+				else
+					tfail( f )
+				end
+				
+			elsif f =~ /(\[|\()([0-9a-fA-F]{8})(\]|\))\.(avi|mkv|mp4|ogm|asf|rm|ram|webm)$/i
+				# check media file containing crc32 sum at end of filename
+
+				fcrc = File.crc32(f)
+				
+				if f.downcase.include?(fcrc)
+					tpass( f )
+				else
+					tfail( f )
+				end
+				
+			elsif f =~ /\.sfv$/i
+				# check files contained in sfv
+
+				ck_files = load_cksum_list( 'sfv', f )
+				
+				for file, sum in ck_files
+					file = File.dirname( f ) + '/' + file
+					
+					if ! File.file?( file )
+						puts "SFV: missing #{file}"
+						next
+					end
+					
+					next if File.passed?( file )
+					
+					fcrc = File.crc32(file)
+					
+					if sum.downcase == fcrc.downcase
+						tpass( file )
+					else
+						tfail( file )
+					end
+				end
+			elsif f =~ /\.md5$/i
+				ck_files = load_cksum_list( 'md5', f )
+				
+				for file, sum in ck_files
+					next unless file and sum
+
+					file = File.dirname( f ) + '/' + file
+					
+					if ! File.file?( file )
+						puts "MD5: missing #{file}"
+						next
+					end
+					
+					next if File.passed?( file )
+					
+					fmd5 = File.md5( file )
+					
+					if sum.downcase == fmd5.downcase
+						tpass( file )
+					else
+						tfail( file )
+					end
+				end
+			end
+			
+		elsif File.directory?( f ) and $recursive
+			chkDir(f)
+		end
+	end
+end
+
+
+for dir in dirs
+	chkDir(dir)
+end
+
+puts 'all done'
+#</main>
